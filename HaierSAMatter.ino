@@ -1,199 +1,469 @@
-// Copyright 2025 Espressif Systems (Shanghai) PTE LTD
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Haier SAMatter – Modbus-controlled heat pump bridge for ESP32-C6
+// Adds State (OFF/HEAT/COOL), Mode (QUIET/ECO/TURBO), target temperature,
+// and read-only telemetry (twi, two, compressor Hz/target) exposed via Matter.
 
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-// Matter Manager
-#include <Matter.h>
-#include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
+#include <Matter.h>
 #include <MatterEndpoints/MatterTemperatureControlledCabinet.h>
+#include <MatterEndpoints/MatterTemperatureSensor.h>
+#include <MatterEndpoints/MatterPressureSensor.h>
+#include <ModbusMaster.h>
+#include <Preferences.h>
+#include <HardwareSerial.h>
+#include <vector>
 
-// List of Matter Endpoints for this Node
-// Color Light Endpoint
-MatterColorLight ColorLight;
+// ----------------------- Hardware mapping -----------------------
+constexpr uint8_t RS485_RX_PIN = 17;   // UART RX from RS485
+constexpr uint8_t RS485_TX_PIN = 16;   // UART TX to RS485
+constexpr uint8_t RELAY_PIN = 2;       // Disconnect relay (isolate remote during writes)
+constexpr uint8_t NEOPIXEL_PIN = 8;    // Onboard NeoPixel
+constexpr uint8_t NEOPIXEL_COUNT = 1;
 
-// it will keep last OnOff & HSV Color state stored, using Preferences
+// ----------------------- Modbus constants -----------------------
+constexpr uint8_t MODBUS_ID = 0x11;
+constexpr uint32_t MODBUS_BAUD = 9600;
+constexpr uint8_t MODBUS_CFG = SERIAL_8E1;
+
+// Frame signature we wait for before writing (R241 block: 0x11 0x03 0x2C + 44 data + CRC)
+constexpr size_t R241_FRAME_BYTES = 49;
+constexpr uint8_t R241_BYTE_COUNT = 0x2C;
+constexpr uint32_t WRITE_IDLE_GAP_MS = 30;   // Idle gap after frame end before asserting relay
+constexpr uint32_t RELAY_SETTLE_MS = 120;    // Settle after relay toggle
+
+// ----------------------- Matter configuration -----------------------
+constexpr double TARGET_TEMP_MIN_C = 5.0;
+constexpr double TARGET_TEMP_MAX_C = 60.0;
+constexpr double TARGET_TEMP_STEP_C = 0.5;
+constexpr double TARGET_TEMP_DEFAULT_C = 22.0;
+
+// State and Mode enumerations mapped to compact integer values for Matter number endpoints
+enum class PumpState : uint8_t { Off = 0, Heat = 1, Cool = 2 };
+enum class PumpMode : uint8_t { Eco = 0, Quiet = 1, Turbo = 2 };
+
+struct Telemetry {
+  PumpState state = PumpState::Off;
+  PumpMode mode = PumpMode::Eco;
+  double setTempC = TARGET_TEMP_DEFAULT_C;
+  double twiC = 0.0;
+  double twoC = 0.0;
+  double compHz = 0.0;
+  double compTargetHz = 0.0;
+};
+
+struct RegisterBlock {
+  uint16_t startAddress;
+  uint8_t length;
+  uint8_t expectedByteCount;
+};
+
+constexpr RegisterBlock BLOCKS[] = {
+    {101, 6, 0x0C},  // R101 block
+    {141, 16, 0x20}, // R141 block
+    {201, 1, 0x02},  // R201 block
+    {241, 22, 0x2C}  // R241 block (triggers safe write window)
+};
+
+// ----------------------- Globals -----------------------
 Preferences matterPref;
-const char *onOffPrefKey = "OnOff";
-const char *hsvColorPrefKey = "HSV";
-const char *targetTempPrefKey = "TargetTemp";
+HardwareSerial rs485Serial(1);
+ModbusMaster modbus;
+Adafruit_NeoPixel pixel(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
-// set your board RGB LED pin here
-// ESP32-C6 onboard NeoPixel (WS2812) is wired to GPIO8
-constexpr uint8_t neoPixelPin = 8;
-constexpr uint8_t neoPixelCount = 1;
-Adafruit_NeoPixel onboardPixel(neoPixelCount, neoPixelPin, NEO_GRB + NEO_KHZ800);
-
-// Matter temperature endpoint (acts as a numeric control surfaced to Home Assistant)
-class TargetTemperatureEndpoint : public MatterTemperatureControlledCabinet {
+// Matter endpoints (numbers for control, sensors for telemetry)
+class NumberEndpoint : public MatterTemperatureControlledCabinet {
 public:
-  using TargetTempCB = std::function<void(double)>;
+  using ChangeCB = std::function<void(double)>;
+  void onChange(ChangeCB cb) { callback = cb; }
 
-  void onTargetTemperatureChange(TargetTempCB cb) { onChangeCb = cb; }
-
-  bool attributeChangeCB(uint16_t endpoint_id, uint32_t cluster_id, uint32_t attribute_id, esp_matter_attr_val_t *val) override {
+  bool attributeChangeCB(uint16_t endpoint_id, uint32_t cluster_id, uint32_t attribute_id,
+                         esp_matter_attr_val_t *val) override {
     bool ret = MatterTemperatureControlledCabinet::attributeChangeCB(endpoint_id, cluster_id, attribute_id, val);
     if (cluster_id == chip::app::Clusters::TemperatureControl::Id &&
         attribute_id == chip::app::Clusters::TemperatureControl::Attributes::TemperatureSetpoint::Id &&
-        onChangeCb) {
-      // TemperatureSetpoint is encoded as 1/100th of a degree Celsius
-      onChangeCb(static_cast<double>(val->val.i16) / 100.0);
+        callback) {
+      callback(static_cast<double>(val->val.i16) / 100.0);
     }
     return ret;
   }
 
 private:
-  TargetTempCB onChangeCb = nullptr;
+  ChangeCB callback = nullptr;
 };
 
-TargetTemperatureEndpoint TargetTempControl;
-constexpr double targetTempMinC = 5.0;
-constexpr double targetTempMaxC = 60.0;
-constexpr double targetTempStepC = 0.5;
-constexpr double targetTempDefaultC = 22.0;
+NumberEndpoint TargetTempControl;
+NumberEndpoint StateControl;  // OFF/HEAT/COOL -> 0/1/2
+NumberEndpoint ModeControl;   // ECO/QUIET/TURBO -> 0/1/2
 
-// set your board USER BUTTON pin here
-const uint8_t buttonPin = BOOT_PIN;  // Set your pin here. Using BOOT Button.
+MatterTemperatureSensor InletTempSensor;   // twi
+MatterTemperatureSensor OutletTempSensor;  // two
+MatterPressureSensor CompressorHzSensor;   // current Hz
+MatterPressureSensor CompressorTargetHzSensor;  // target Hz
 
-// Button control
-uint32_t button_time_stamp = 0;                // debouncing control
-bool button_state = false;                     // false = released | true = pressed
-const uint32_t debouceTime = 250;              // button debouncing time (ms)
-const uint32_t decommissioningTimeout = 5000;  // keep the button pressed for 5s, or longer, to decommission
+// Register cache and tracking
+uint16_t holdingRegisters[256] = {0};
+bool registersUpdated = false;
+Telemetry currentTelemetry;
+Telemetry lastConfirmed;  // Used to revert Matter state on failed write
 
-// Set the RGB LED Light based on the current state of the Color Light
-bool setLightState(bool state, espHsvColor_t colorHSV) {
+// Frame assembly
+std::vector<uint8_t> frameBuf;
+size_t expectedFrameLen = 0;
+unsigned long lastByteAt = 0;
+unsigned long lastSafeFrameAt = 0;
+bool safeWindow = false;
+bool isWriting = false;
 
-  espRgbColor_t rgbColor = espHsvColorToRgbColor(colorHSV);
-  if (state) {
-    onboardPixel.setPixelColor(0, onboardPixel.Color(rgbColor.r, rgbColor.g, rgbColor.b));
-  } else {
-    onboardPixel.setPixelColor(0, 0);
+// Pending write request from Matter
+enum class WriteKind { None, State, Mode, Temp };
+struct PendingWrite {
+  WriteKind kind = WriteKind::None;
+  double value = 0.0;
+};
+PendingWrite pending;
+
+// ----------------------- Utility helpers -----------------------
+uint8_t encodeState(PumpState state) {
+  switch (state) {
+    case PumpState::Off: return 0x00;
+    case PumpState::Cool: return 0x03;
+    case PumpState::Heat: return 0x05;
   }
-  onboardPixel.show();
-  // store last HSV Color and OnOff state for when the Light is restarted / power goes off
-  matterPref.putBool(onOffPrefKey, state);
-  matterPref.putUInt(hsvColorPrefKey, colorHSV.h << 16 | colorHSV.s << 8 | colorHSV.v);
-  // This callback must return the success state to Matter core
-  return true;
+  return 0x00;
+}
+
+PumpState decodeState(uint16_t r101) {
+  uint8_t low = r101 & 0xFF;
+  if (low == 0x03) return PumpState::Cool;
+  if (low == 0x05) return PumpState::Heat;
+  return PumpState::Off;
+}
+
+PumpMode decodeMode(uint16_t r201) {
+  switch (r201) {
+    case 0: return PumpMode::Eco;
+    case 1: return PumpMode::Quiet;
+    case 2: return PumpMode::Turbo;
+    default: return PumpMode::Eco;
+  }
+}
+
+uint16_t encodeMode(PumpMode mode) {
+  switch (mode) {
+    case PumpMode::Eco: return 0;
+    case PumpMode::Quiet: return 1;
+    case PumpMode::Turbo: return 2;
+  }
+  return 0;
+}
+
+double decodeSetTemp(uint16_t r102) {
+  uint8_t high = (r102 >> 8) & 0xFF;
+  return static_cast<double>(high) / 2.0;
+}
+
+uint16_t encodeSetTemp(uint16_t baseR102, double tempC) {
+  uint8_t low = baseR102 & 0xFF;
+  uint8_t high = static_cast<uint8_t>(tempC * 2.0);
+  return static_cast<uint16_t>((high << 8) | low);
+}
+
+double decodeTwi(uint16_t r146, uint16_t r147) {
+  uint8_t lowNibble = r146 & 0x0F;
+  uint8_t upper = (r147 >> 8) & 0xFF;
+  return static_cast<double>((lowNibble << 8) | upper) / 10.0;
+}
+
+double decodeTwo(uint16_t r146, uint16_t r147) {
+  uint8_t highNibble = (r146 >> 4) & 0x0F;
+  uint8_t low = r147 & 0xFF;
+  return static_cast<double>((highNibble << 8) | low) / 10.0;
+}
+
+double decodeCompFreq(uint16_t r243) { return static_cast<double>(r243 & 0xFF); }
+double decodeCompTargetFreq(uint16_t r244) { return static_cast<double>((r244 >> 8) & 0xFF); }
+
+void blinkFailure() {
+  pixel.setPixelColor(0, pixel.Color(255, 0, 0));
+  pixel.show();
+  delay(150);
+  pixel.clear();
+  pixel.show();
+}
+
+// ----------------------- Register update -----------------------
+void applyRegister(uint16_t address, uint16_t value) {
+  if (holdingRegisters[address] != value) {
+    holdingRegisters[address] = value;
+    registersUpdated = true;
+  }
+}
+
+void updateTelemetryFromRegisters() {
+  currentTelemetry.state = decodeState(holdingRegisters[101]);
+  currentTelemetry.mode = decodeMode(holdingRegisters[201]);
+  currentTelemetry.setTempC = decodeSetTemp(holdingRegisters[102]);
+  currentTelemetry.twiC = decodeTwi(holdingRegisters[146], holdingRegisters[147]);
+  currentTelemetry.twoC = decodeTwo(holdingRegisters[146], holdingRegisters[147]);
+  currentTelemetry.compHz = decodeCompFreq(holdingRegisters[243]);
+  currentTelemetry.compTargetHz = decodeCompTargetFreq(holdingRegisters[244]);
+}
+
+// ----------------------- Matter sync -----------------------
+void publishMatterTelemetry() {
+  // Write sensors
+  InletTempSensor.setTemperature(currentTelemetry.twiC);
+  OutletTempSensor.setTemperature(currentTelemetry.twoC);
+  CompressorHzSensor.setPressure(currentTelemetry.compHz);
+  CompressorTargetHzSensor.setPressure(currentTelemetry.compTargetHz);
+
+  // Write control numbers to reflect confirmed state
+  TargetTempControl.setTemperatureSetpoint(currentTelemetry.setTempC);
+  StateControl.setTemperatureSetpoint(static_cast<double>(static_cast<uint8_t>(currentTelemetry.state)));
+  ModeControl.setTemperatureSetpoint(static_cast<double>(static_cast<uint8_t>(currentTelemetry.mode)));
+
+  lastConfirmed = currentTelemetry;
+}
+
+void revertMatterAttribute(const PendingWrite &req) {
+  switch (req.kind) {
+    case WriteKind::State:
+      StateControl.setTemperatureSetpoint(static_cast<double>(static_cast<uint8_t>(lastConfirmed.state)));
+      break;
+    case WriteKind::Mode:
+      ModeControl.setTemperatureSetpoint(static_cast<double>(static_cast<uint8_t>(lastConfirmed.mode)));
+      break;
+    case WriteKind::Temp:
+      TargetTempControl.setTemperatureSetpoint(lastConfirmed.setTempC);
+      break;
+    default:
+      break;
+  }
+  blinkFailure();
+}
+
+// ----------------------- Modbus parsing -----------------------
+void resetFrame() {
+  frameBuf.clear();
+  expectedFrameLen = 0;
+}
+
+void processFrame(const std::vector<uint8_t> &frame) {
+  if (frame.size() < 5) return;  // minimal sanity (addr, func, count, data..., crc)
+  if (frame[0] != MODBUS_ID || frame[1] != 0x03) return;
+  uint8_t byteCount = frame[2];
+
+  // Update safe window if this is the R241 block
+  if (byteCount == R241_BYTE_COUNT) {
+    safeWindow = true;
+    lastSafeFrameAt = millis();
+  }
+
+  // Identify block by byte count
+  for (const auto &block : BLOCKS) {
+    if (block.expectedByteCount != byteCount) continue;
+    size_t required = 3 + block.length * 2;
+    if (frame.size() < required) continue;
+    for (uint8_t i = 0; i < block.length; i++) {
+      uint8_t hi = frame[3 + i * 2];
+      uint8_t lo = frame[4 + i * 2];
+      applyRegister(block.startAddress + i, static_cast<uint16_t>((hi << 8) | lo));
+    }
+    break;
+  }
+}
+
+void ingestSerial() {
+  while (rs485Serial.available()) {
+    uint8_t b = rs485Serial.read();
+    lastByteAt = millis();
+
+    if (frameBuf.empty()) {
+      if (b == MODBUS_ID) {
+        frameBuf.push_back(b);
+      }
+      continue;
+    }
+
+    frameBuf.push_back(b);
+    if (frameBuf.size() == 3) {
+      expectedFrameLen = 3 + frameBuf[2] + 2;  // +CRC
+      if (expectedFrameLen > 200) {
+        resetFrame();
+      }
+    }
+
+    if (expectedFrameLen > 0 && frameBuf.size() >= expectedFrameLen) {
+      processFrame(frameBuf);
+      resetFrame();
+    }
+  }
+}
+
+// ----------------------- Modbus writes -----------------------
+bool readyToWrite() {
+  if (!safeWindow) return false;
+  if (millis() - lastSafeFrameAt > 3000) {
+    safeWindow = false;
+    return false;
+  }
+  return (millis() - lastByteAt) > WRITE_IDLE_GAP_MS;
+}
+
+void setRelay(bool enabled) {
+  digitalWrite(RELAY_PIN, enabled ? HIGH : LOW);
+}
+
+bool writeState(PumpState newState) {
+  uint16_t r101 = holdingRegisters[101];
+  uint8_t hi = (r101 >> 8) & 0xFF;
+  uint8_t lo = encodeState(newState);
+  uint16_t regs[6];
+  regs[0] = static_cast<uint16_t>((hi << 8) | lo);
+  for (int i = 1; i < 6; i++) {
+    regs[i] = holdingRegisters[101 + i];
+  }
+  for (int i = 0; i < 6; i++) modbus.setTransmitBuffer(i, regs[i]);
+  uint8_t rc = modbus.writeMultipleRegisters(101, 6);
+  if (rc == modbus.ku8MBSuccess) {
+    applyRegister(101, regs[0]);
+    return true;
+  }
+  return false;
+}
+
+bool writeMode(PumpMode mode) {
+  uint16_t value = 256 + encodeMode(mode);
+  modbus.setTransmitBuffer(0, value);
+  uint8_t rc = modbus.writeMultipleRegisters(201, 1);
+  if (rc == modbus.ku8MBSuccess) {
+    applyRegister(201, value);
+    return true;
+  }
+  return false;
+}
+
+bool writeTemp(double tempC) {
+  uint16_t regs[6];
+  regs[0] = holdingRegisters[101];
+  regs[1] = encodeSetTemp(holdingRegisters[102], tempC);
+  for (int i = 2; i < 6; i++) regs[i] = holdingRegisters[101 + i];
+  for (int i = 0; i < 6; i++) modbus.setTransmitBuffer(i, regs[i]);
+  uint8_t rc = modbus.writeMultipleRegisters(101, 6);
+  if (rc == modbus.ku8MBSuccess) {
+    applyRegister(102, regs[1]);
+    return true;
+  }
+  return false;
+}
+
+bool performWrite(const PendingWrite &req) {
+  if (!readyToWrite()) return false;
+
+  isWriting = true;
+  safeWindow = false;  // consume the window
+
+  setRelay(true);
+  delay(RELAY_SETTLE_MS);
+  while (rs485Serial.available()) rs485Serial.read();
+
+  bool ok = false;
+  switch (req.kind) {
+    case WriteKind::State:
+      ok = writeState(static_cast<PumpState>(static_cast<uint8_t>(req.value)));
+      break;
+    case WriteKind::Mode:
+      ok = writeMode(static_cast<PumpMode>(static_cast<uint8_t>(req.value)));
+      break;
+    case WriteKind::Temp:
+      ok = writeTemp(req.value);
+      break;
+    default:
+      break;
+  }
+
+  delay(50);
+  setRelay(false);
+  isWriting = false;
+
+  if (!ok) {
+    revertMatterAttribute(req);
+  }
+  return ok;
+}
+
+// ----------------------- Matter callbacks -----------------------
+void queueWrite(WriteKind kind, double value) {
+  pending.kind = kind;
+  pending.value = value;
+}
+
+void handleStateChange(double v) { queueWrite(WriteKind::State, v); }
+void handleModeChange(double v) { queueWrite(WriteKind::Mode, v); }
+void handleTempChange(double v) { queueWrite(WriteKind::Temp, v); }
+
+// ----------------------- Setup & loop -----------------------
+void setupModbus() {
+  rs485Serial.begin(MODBUS_BAUD, MODBUS_CFG, RS485_RX_PIN, RS485_TX_PIN);
+  rs485Serial.setRxBufferSize(1024);
+  modbus.begin(MODBUS_ID, rs485Serial);
+}
+
+void setupMatter() {
+  matterPref.begin("MatterPrefs", false);
+
+  pixel.begin();
+  pixel.clear();
+  pixel.show();
+
+  // Control endpoints
+  TargetTempControl.begin(TARGET_TEMP_DEFAULT_C, TARGET_TEMP_MIN_C, TARGET_TEMP_MAX_C, TARGET_TEMP_STEP_C);
+  TargetTempControl.onChange(handleTempChange);
+
+  StateControl.begin(0.0, 0.0, 2.0, 1.0);
+  StateControl.onChange(handleStateChange);
+
+  ModeControl.begin(0.0, 0.0, 2.0, 1.0);
+  ModeControl.onChange(handleModeChange);
+
+  // Telemetry sensors
+  InletTempSensor.begin();
+  OutletTempSensor.begin();
+  CompressorHzSensor.begin();
+  CompressorTargetHzSensor.begin();
+
+  Matter.begin();
 }
 
 void setup() {
-  // Initialize the USER BUTTON (Boot button) GPIO that will act as a toggle switch
-  pinMode(buttonPin, INPUT_PULLUP);
-  // Initialize the onboard NeoPixel and Matter End Point
-  onboardPixel.begin();
-  onboardPixel.clear();
-  onboardPixel.show();
-
   Serial.begin(115200);
+  pinMode(RELAY_PIN, OUTPUT);
+  setRelay(false);
 
-  // Initialize Matter EndPoint
-  matterPref.begin("MatterPrefs", false);
-  // default OnOff state is ON if not stored before
-  bool lastOnOffState = matterPref.getBool(onOffPrefKey, true);
-  // default HSV color is blue HSV(169, 254, 254)
-  uint32_t prefHsvColor = matterPref.getUInt(hsvColorPrefKey, 169 << 16 | 254 << 8 | 254);
-  espHsvColor_t lastHsvColor = {uint8_t(prefHsvColor >> 16), uint8_t(prefHsvColor >> 8), uint8_t(prefHsvColor)};
-  ColorLight.begin(lastOnOffState, lastHsvColor);
-  // set the callback function to handle the Light state change
-  ColorLight.onChange(setLightState);
+  setupModbus();
+  setupMatter();
 
-  // Initialize Target Temperature endpoint (visible in Home Assistant as a Number)
-  double storedTargetTemp = (double)matterPref.getInt(targetTempPrefKey, (int)(targetTempDefaultC * 100)) / 100.0;
-  // clamp stored value within allowed range
-  if (storedTargetTemp < targetTempMinC || storedTargetTemp > targetTempMaxC) {
-    storedTargetTemp = targetTempDefaultC;
-  }
-  TargetTempControl.begin(storedTargetTemp, targetTempMinC, targetTempMaxC, targetTempStepC);
-  TargetTempControl.onTargetTemperatureChange([](double tempC) {
-    Serial.printf("Target Temperature changed to %.1fC\r\n", tempC);
-    matterPref.putInt(targetTempPrefKey, (int)(tempC * 100));  // persist in 1/100 C
-    // TODO: react to new target temperature here (drive heaters/relays/etc.)
-  });
+  // Initialize Matter values to defaults until first Modbus frame arrives
+  publishMatterTelemetry();
+}
 
-  // lambda functions are used to set the attribute change callbacks
-  ColorLight.onChangeOnOff([](bool state) {
-    Serial.printf("Light OnOff changed to %s\r\n", state ? "ON" : "OFF");
-    return true;
-  });
-  ColorLight.onChangeColorHSV([](HsvColor_t hsvColor) {
-    Serial.printf("Light HSV Color changed to (%d,%d,%d)\r\n", hsvColor.h, hsvColor.s, hsvColor.v);
-    return true;
-  });
+void processPendingWrite() {
+  if (pending.kind == WriteKind::None) return;
+  if (isWriting) return;
+  if (!readyToWrite()) return;
 
-  // Matter beginning - Last step, after all EndPoints are initialized
-  Matter.begin();
-  // This may be a restart of a already commissioned Matter accessory
-  if (Matter.isDeviceCommissioned()) {
-    Serial.println("Matter Node is commissioned and connected to the network. Ready for use.");
-    Serial.printf(
-      "Initial state: %s | RGB Color: (%d,%d,%d) \r\n", ColorLight ? "ON" : "OFF", ColorLight.getColorRGB().r, ColorLight.getColorRGB().g,
-      ColorLight.getColorRGB().b
-    );
-    // configure the Light based on initial on-off state and its color
-    ColorLight.updateAccessory();
-  }
+  PendingWrite req = pending;
+  pending.kind = WriteKind::None;
+  performWrite(req);
 }
 
 void loop() {
-  // Check Matter Light Commissioning state, which may change during execution of loop()
-  if (!Matter.isDeviceCommissioned()) {
-    Serial.println("");
-    Serial.println("Matter Node is not commissioned yet.");
-    Serial.println("Initiate the device discovery in your Matter environment.");
-    Serial.println("Commission it to your Matter hub with the manual pairing code or QR code");
-    Serial.printf("Manual pairing code: %s\r\n", Matter.getManualPairingCode().c_str());
-    Serial.printf("QR code URL: %s\r\n", Matter.getOnboardingQRCodeUrl().c_str());
-    // waits for Matter Light Commissioning.
-    uint32_t timeCount = 0;
-    while (!Matter.isDeviceCommissioned()) {
-      delay(100);
-      if ((timeCount++ % 50) == 0) {  // 50*100ms = 5 sec
-        Serial.println("Matter Node not commissioned yet. Waiting for commissioning.");
-      }
-    }
-    Serial.printf(
-      "Initial state: %s | RGB Color: (%d,%d,%d) \r\n", ColorLight ? "ON" : "OFF", ColorLight.getColorRGB().r, ColorLight.getColorRGB().g,
-      ColorLight.getColorRGB().b
-    );
-    // configure the Light based on initial on-off state and its color
-    ColorLight.updateAccessory();
-    Serial.println("Matter Node is commissioned and connected to the network. Ready for use.");
+  ingestSerial();
+
+  if (registersUpdated) {
+    registersUpdated = false;
+    updateTelemetryFromRegisters();
+    publishMatterTelemetry();
   }
 
-  // A button is also used to control the light
-  // Check if the button has been pressed
-  if (digitalRead(buttonPin) == LOW && !button_state) {
-    // deals with button debouncing
-    button_time_stamp = millis();  // record the time while the button is pressed.
-    button_state = true;           // pressed.
-  }
-
-  // Onboard User Button is used as a Light toggle switch or to decommission it
-  uint32_t time_diff = millis() - button_time_stamp;
-  if (digitalRead(buttonPin) == HIGH && button_state && time_diff > debouceTime) {
-    // Toggle button is released - toggle the light
-    Serial.println("User button released. Toggling Light!");
-    ColorLight.toggle();   // Matter Controller also can see the change
-    button_state = false;  // released
-  }
-
-  // Onboard User Button is kept pressed for longer than 5 seconds in order to decommission matter node
-  if (button_state && time_diff > decommissioningTimeout) {
-    Serial.println("Decommissioning the Light Matter Accessory. It shall be commissioned again.");
-    ColorLight = false;  // turn the light off
-    Matter.decommission();
-    button_time_stamp = millis();  // avoid running decommissining again, reboot takes a second or so
-  }
+  processPendingWrite();
 }
