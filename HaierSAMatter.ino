@@ -21,8 +21,6 @@
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
 #include <MatterEndpoints/MatterTemperatureControlledCabinet.h>
-#include <ArduinoOTA.h>
-#include "mdns.h"
 
 // List of Matter Endpoints for this Node
 // Color Light Endpoint
@@ -126,34 +124,6 @@ void setup() {
   Serial.println("\r\nWiFi connected");
   Serial.println("IP address: ");
   Serial.println(WiFi.localIP());
-  
-  // Initialize ArduinoOTA
-  ArduinoOTA.setHostname("haier-matter-c6");
-  ArduinoOTA.setPassword("admin");
-  ArduinoOTA
-    .onStart([]() {
-      Serial.println("OTA Update Request Received!");
-      String type;
-      if (ArduinoOTA.getCommand() == U_FLASH)
-        type = "sketch";
-      else // U_SPIFFS
-        type = "filesystem";
-      Serial.println("Start updating " + type);
-    })
-    .onEnd([]() {
-      Serial.println("\nEnd");
-    })
-    .onProgress([](unsigned int progress, unsigned int total) {
-      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-    })
-    .onError([](ota_error_t error) {
-      Serial.printf("Error[%u]: ", error);
-      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-      else if (error == OTA_END_ERROR) Serial.println("End Failed");
-    });
 #endif
 
   // Initialize Matter EndPoint
@@ -202,26 +172,9 @@ void setup() {
     // configure the Light based on initial on-off state and its color
     ColorLight.updateAccessory();
   }
-
-#if !CONFIG_ENABLE_CHIPOBLE
-  // Start OTA last to ensure mDNS isn't stomped by Matter init
-  Serial.println("Starting ArduinoOTA...");
-
-  // Use low-level ESP-IDF mDNS API to bypass Arduino wrapper conflicts
-  mdns_service_add(NULL, "_arduino", "_tcp", 3232, NULL, 0);
-  mdns_service_instance_set("_arduino", "_tcp", "haier-matter-c6");
-  mdns_service_txt_item_add("_arduino", "_tcp", "board", "esp32c6");
-  Serial.println("Low-level mDNS service added for Arduino OTA.");
-
-  ArduinoOTA.begin();
-  Serial.println("ArduinoOTA started.");
-#endif
 }
 
 void loop() {
-  // Handle OTA updates
-  ArduinoOTA.handle();
-
   // Check Matter Light Commissioning state, which may change during execution of loop()
   if (!Matter.isDeviceCommissioned()) {
     Serial.println("");
@@ -233,7 +186,6 @@ void loop() {
     // waits for Matter Light Commissioning.
     uint32_t timeCount = 0;
     while (!Matter.isDeviceCommissioned()) {
-      ArduinoOTA.handle();  // Keep OTA responsive while waiting for Matter commissioning
       delay(100);
       if ((timeCount++ % 50) == 0) {  // 50*100ms = 5 sec
         Serial.println("Matter Node not commissioned yet. Waiting for commissioning.");
