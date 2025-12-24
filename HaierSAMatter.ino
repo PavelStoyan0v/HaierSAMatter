@@ -14,10 +14,6 @@
 
 // Matter Manager
 #include <Matter.h>
-#if !CONFIG_ENABLE_CHIPOBLE
-// if the device can be commissioned using BLE, WiFi is not used - save flash space
-#include <WiFi.h>
-#endif
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
 #include <MatterEndpoints/MatterTemperatureControlledCabinet.h>
@@ -25,13 +21,6 @@
 // List of Matter Endpoints for this Node
 // Color Light Endpoint
 MatterColorLight ColorLight;
-
-// CONFIG_ENABLE_CHIPOBLE is enabled when BLE is used to commission the Matter Network
-#if !CONFIG_ENABLE_CHIPOBLE
-// WiFi is manually set and started
-const char *ssid = "YOUR_SSID";          // Change this to your WiFi SSID
-const char *password = "YOUR_PASSWORD";  // Change this to your WiFi password
-#endif
 
 // it will keep last OnOff & HSV Color state stored, using Preferences
 Preferences matterPref;
@@ -108,23 +97,6 @@ void setup() {
   onboardPixel.show();
 
   Serial.begin(115200);
-
-// CONFIG_ENABLE_CHIPOBLE is enabled when BLE is used to commission the Matter Network
-#if !CONFIG_ENABLE_CHIPOBLE
-  // We start by connecting to a WiFi network
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-  // Manually connect to WiFi
-  WiFi.begin(ssid, password);
-  // Wait for connection
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\r\nWiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-#endif
 
   // Initialize Matter EndPoint
   matterPref.begin("MatterPrefs", false);
