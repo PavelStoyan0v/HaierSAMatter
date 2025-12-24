@@ -1,0 +1,15 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configure Haier Matter Bridge",
+        "description": "Enter the Node ID and Endpoint ID of your Haier bridge device as seen in the Matter integration.",
+        "data": {
+          "node_id": "Matter Node ID",
+          "endpoint_id": "Endpoint ID (usually 1)"
+        }
+      }
+    }
+  }
+}
+

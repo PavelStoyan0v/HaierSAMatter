@@ -1,0 +1,14 @@
+{
+  "domain": "haier_matter",
+  "name": "Haier Matter Bridge",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["matter"],
+  "documentation": "https://github.com/your-repo/haier-matter",
+  "iot_class": "local_push",
+  "loggers": ["haier_matter"],
+  "manifest_version": 2,
+  "requirements": [],
+  "version": "1.0.0"
+}
+
