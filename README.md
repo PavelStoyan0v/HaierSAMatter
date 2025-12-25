@@ -28,6 +28,18 @@ The integration will create:
 
 Note: The standard **Target Temperature** setpoint and **Inlet/Outlet** temperatures are handled by the native Matter integration.
 
+### Status LED (NeoPixel)
+The onboard LED indicates the bridge and network status:
+
+| Color | State | Meaning |
+| :--- | :--- | :--- |
+| **White (Pulsing)** | **Pairing** | Device is not commissioned. Waiting for Matter pairing. |
+| **Orange** | **Offline** | Commissioned but lost connection to Matter network. |
+| **Green (Dim)** | **Healthy** | Connected to Matter and receiving Modbus data. |
+| **Magenta** | **Pending** | Matter command received, waiting for safe Modbus window. |
+| **Yellow** | **Writing** | Actively sending command to Heat Pump (Relay isolated). |
+| **Red (Blinking)** | **Error** | Hardware/Modbus timeout (No data for >10s). |
+
 Notes:
 - Keep using the standard TemperatureControlledCabinet setpoint for target temperature; no vendor attribute is needed for temperature.
 - State/Mode writes remain single-attempt with relay isolation; if a write fails the device reverts the attribute value.

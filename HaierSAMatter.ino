@@ -119,6 +119,7 @@ std::vector<uint8_t> frameBuf;
 size_t expectedFrameLen = 0;
 unsigned long lastByteAt = 0;
 unsigned long lastSafeFrameAt = 0;
+unsigned long lastModbusFrameAt = 0; // Track for "Hardware Error" status
 bool safeWindow = false;
 bool isWriting = false;
 
@@ -199,6 +200,43 @@ void blinkFailure() {
   pixel.show();
 }
 
+// ----------------------- Status LED -----------------------
+void updateStatusLED() {
+  static unsigned long lastUpdate = 0;
+  if (millis() - lastUpdate < 20) return; // 50Hz update for smooth pulsing
+  lastUpdate = millis();
+
+  // 1. Hardware Error: No Modbus frames for 10 seconds
+  if (millis() - lastModbusFrameAt > 10000 && lastModbusFrameAt > 0) {
+    // Fast Red Blink
+    if ((millis() / 250) % 2 == 0) pixel.setPixelColor(0, pixel.Color(255, 0, 0));
+    else pixel.setPixelColor(0, 0);
+  }
+  // 2. Modbus Writing: Yellow (handled in performWrite, but as a backup here)
+  else if (isWriting) {
+    pixel.setPixelColor(0, pixel.Color(255, 200, 0));
+  }
+  // 3. Write Pending: Magenta
+  else if (pending.kind != WriteKind::None) {
+    pixel.setPixelColor(0, pixel.Color(255, 0, 255));
+  }
+  // 4. Commissioning Mode: White Pulse
+  else if (!Matter.isDeviceCommissioned()) {
+    float breath = (exp(sin(millis() / 500.0 * PI)) - 0.36787944) * 108.0;
+    pixel.setPixelColor(0, pixel.Color(breath, breath, breath));
+  }
+  // 5. Offline: Orange (Commissioned but not online)
+  else if (!Matter.isDeviceConnected()) {
+    pixel.setPixelColor(0, pixel.Color(255, 100, 0));
+  }
+  // 6. Healthy: Dim Green
+  else {
+    pixel.setPixelColor(0, pixel.Color(0, 40, 0));
+  }
+  
+  pixel.show();
+}
+
 // ----------------------- Register update -----------------------
 void applyRegister(uint16_t address, uint16_t value) {
   if (holdingRegisters[address] != value) {
@@ -208,9 +246,35 @@ void applyRegister(uint16_t address, uint16_t value) {
 }
 
 void updateTelemetryFromRegisters() {
+  PumpState oldState = currentTelemetry.state;
   currentTelemetry.state = decodeState(holdingRegisters[101]);
+  if (oldState != currentTelemetry.state) {
+    Serial.print("State change: ");
+    switch (currentTelemetry.state) {
+      case PumpState::Off:  Serial.println("OFF");  break;
+      case PumpState::Heat: Serial.println("HEAT"); break;
+      case PumpState::Cool: Serial.println("COOL"); break;
+    }
+  }
+
+  PumpMode oldMode = currentTelemetry.mode;
   currentTelemetry.mode = decodeMode(holdingRegisters[201]);
+  if (oldMode != currentTelemetry.mode) {
+    Serial.print("Mode change: ");
+    switch (currentTelemetry.mode) {
+      case PumpMode::Eco:   Serial.println("ECO");   break;
+      case PumpMode::Quiet: Serial.println("QUIET"); break;
+      case PumpMode::Turbo: Serial.println("TURBO"); break;
+    }
+  }
+
+  double oldTemp = currentTelemetry.setTempC;
   currentTelemetry.setTempC = decodeSetTemp(holdingRegisters[102]);
+  if (abs(oldTemp - currentTelemetry.setTempC) > 0.1) {
+    Serial.print("Target Temp change: ");
+    Serial.println(currentTelemetry.setTempC, 1);
+  }
+
   currentTelemetry.twiC = decodeTwi(holdingRegisters[146], holdingRegisters[147]);
   currentTelemetry.twoC = decodeTwo(holdingRegisters[146], holdingRegisters[147]);
   currentTelemetry.compHz = decodeCompFreq(holdingRegisters[243]);
@@ -274,8 +338,11 @@ void processFrame(const std::vector<uint8_t> &frame) {
   if (frame[0] != MODBUS_ID || frame[1] != 0x03) return;
   uint8_t byteCount = frame[2];
 
+  lastModbusFrameAt = millis(); // Valid frame received
+
   // Update safe window if this is the R241 block
   if (byteCount == R241_BYTE_COUNT) {
+    if (!safeWindow) Serial.println("Safe write window OPENED (R241 frame)");
     safeWindow = true;
     lastSafeFrameAt = millis();
   }
@@ -325,6 +392,7 @@ void ingestSerial() {
 bool readyToWrite() {
   if (!safeWindow) return false;
   if (millis() - lastSafeFrameAt > 3000) {
+    Serial.println("Safe window CLOSED (timeout)");
     safeWindow = false;
     return false;
   }
@@ -379,11 +447,18 @@ bool writeTemp(double tempC) {
 }
 
 bool performWrite(const PendingWrite &req) {
-  if (!readyToWrite()) return false;
+  if (!readyToWrite()) {
+    Serial.println("Write deferred: Not in safe window or idle gap too small");
+    return false;
+  }
 
   isWriting = true;
   safeWindow = false;  // consume the window
 
+  Serial.println("Starting Modbus write sequence (isolating relay)...");
+  pixel.setPixelColor(0, pixel.Color(255, 200, 0)); // Yellow
+  pixel.show();
+  
   setRelay(true);
   delay(RELAY_SETTLE_MS);
   while (rs485Serial.available()) rs485Serial.read();
@@ -407,7 +482,10 @@ bool performWrite(const PendingWrite &req) {
   setRelay(false);
   isWriting = false;
 
-  if (!ok) {
+  if (ok) {
+    Serial.println("Modbus write SUCCESS");
+  } else {
+    Serial.println("Modbus write FAILED - reverting Matter state");
     revertMatterAttribute(req);
   }
   return ok;
@@ -415,6 +493,13 @@ bool performWrite(const PendingWrite &req) {
 
 // ----------------------- Matter callbacks -----------------------
 void queueWrite(WriteKind kind, double value) {
+  Serial.print("Matter requested write: ");
+  switch (kind) {
+    case WriteKind::State: Serial.print("State -> "); Serial.println(value); break;
+    case WriteKind::Mode:  Serial.print("Mode -> ");  Serial.println(value); break;
+    case WriteKind::Temp:  Serial.print("Temp -> ");  Serial.println(value, 1); break;
+    default: break;
+  }
   pending.kind = kind;
   pending.value = value;
 }
@@ -505,4 +590,5 @@ void loop() {
   }
 
   processPendingWrite();
+  updateStatusLED();
 }
