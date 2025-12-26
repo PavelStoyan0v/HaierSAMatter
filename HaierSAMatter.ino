@@ -39,10 +39,8 @@ constexpr double TARGET_TEMP_DEFAULT_C = 22.0;
 enum class PumpState : uint8_t { Off = 0, Heat = 1, Cool = 2 };
 enum class PumpMode : uint8_t { Eco = 0, Quiet = 1, Turbo = 2 };
 
-// Vendor cluster (VID 0xFFF1) / attribute IDs
-constexpr uint16_t VENDOR_CLUSTER_ID = 0xFC01;
-constexpr uint16_t ATTR_STATE_ID = 0x0001;      // enum8 OFF/HEAT/COOL
-constexpr uint16_t ATTR_MODE_ID = 0x0002;       // enum8 ECO/QUIET/TURBO
+// Vendor cluster (VID 0xFFF1) / attribute IDs (32-bit cluster ID)
+constexpr uint32_t VENDOR_CLUSTER_ID = 0xFFF1FC01;
 constexpr uint16_t ATTR_COMP_HZ_ID = 0x0003;    // uint16
 constexpr uint16_t ATTR_COMP_TARGET_ID = 0x0004;// uint16
 
@@ -97,14 +95,14 @@ private:
 };
 
 NumberEndpoint TargetTempControl;
+NumberEndpoint StateControl;
+NumberEndpoint ModeControl;
 
 MatterTemperatureSensor InletTempSensor;   // twi
 MatterTemperatureSensor OutletTempSensor;  // two
 
 // Vendor cluster handles
 esp_matter::cluster_t *vendorCluster = nullptr;
-esp_matter::attribute_t *attrStateHandle = nullptr;
-esp_matter::attribute_t *attrModeHandle = nullptr;
 esp_matter::attribute_t *attrCompHzHandle = nullptr;
 esp_matter::attribute_t *attrCompTargetHandle = nullptr;
 
@@ -291,11 +289,11 @@ void publishMatterTelemetry() {
   InletTempSensor.setTemperature(currentTelemetry.twiC);
   OutletTempSensor.setTemperature(currentTelemetry.twoC);
   TargetTempControl.setTemperatureSetpoint(currentTelemetry.setTempC);
+  StateControl.setTemperatureSetpoint(static_cast<double>(currentTelemetry.state));
+  ModeControl.setTemperatureSetpoint(static_cast<double>(currentTelemetry.mode));
 
   if (vendorCluster) {
     auto epId = TargetTempControl.getEndPointId();
-    reportVendorAttr(epId, ATTR_STATE_ID, esp_matter_enum8(static_cast<uint8_t>(currentTelemetry.state)));
-    reportVendorAttr(epId, ATTR_MODE_ID, esp_matter_enum8(static_cast<uint8_t>(currentTelemetry.mode)));
     reportVendorAttr(epId, ATTR_COMP_HZ_ID, esp_matter_uint16(static_cast<uint16_t>(currentTelemetry.compHz)));
     reportVendorAttr(epId, ATTR_COMP_TARGET_ID,
                      esp_matter_uint16(static_cast<uint16_t>(currentTelemetry.compTargetHz)));
@@ -307,16 +305,10 @@ void publishMatterTelemetry() {
 void revertMatterAttribute(const PendingWrite &req) {
   switch (req.kind) {
     case WriteKind::State:
-      if (vendorCluster) {
-        reportVendorAttr(TargetTempControl.getEndPointId(), ATTR_STATE_ID,
-                         esp_matter_enum8(static_cast<uint8_t>(lastConfirmed.state)));
-      }
+      StateControl.setTemperatureSetpoint(static_cast<double>(lastConfirmed.state));
       break;
     case WriteKind::Mode:
-      if (vendorCluster) {
-        reportVendorAttr(TargetTempControl.getEndPointId(), ATTR_MODE_ID,
-                         esp_matter_enum8(static_cast<uint8_t>(lastConfirmed.mode)));
-      }
+      ModeControl.setTemperatureSetpoint(static_cast<double>(lastConfirmed.mode));
       break;
     case WriteKind::Temp:
       TargetTempControl.setTemperatureSetpoint(lastConfirmed.setTempC);
@@ -506,19 +498,6 @@ void queueWrite(WriteKind kind, double value) {
 
 void handleTempChange(double v) { queueWrite(WriteKind::Temp, v); }
 
-esp_err_t attributeCallback(esp_matter::attribute::callback_type_t type, uint16_t endpoint_id, uint32_t cluster_id,
-                            uint32_t attribute_id, esp_matter_attr_val_t *val, void *) {
-  if (cluster_id != VENDOR_CLUSTER_ID) return ESP_OK;
-  if (type != esp_matter::attribute::callback_type_t::PRE_UPDATE) return ESP_OK;
-
-  if (attribute_id == ATTR_STATE_ID) {
-    queueWrite(WriteKind::State, static_cast<double>(val->val.u8));
-  } else if (attribute_id == ATTR_MODE_ID) {
-    queueWrite(WriteKind::Mode, static_cast<double>(val->val.u8));
-  }
-  return ESP_OK;
-}
-
 // ----------------------- Setup & loop -----------------------
 void setupModbus() {
   rs485Serial.begin(MODBUS_BAUD, MODBUS_CFG, RS485_RX_PIN, RS485_TX_PIN);
@@ -533,27 +512,27 @@ void setupMatter() {
   pixel.clear();
   pixel.show();
 
-  // Control endpoint (TemperatureControlledCabinet) for setpoint
+  // Control endpoints for target temperature, state, and mode
   TargetTempControl.begin(TARGET_TEMP_DEFAULT_C, TARGET_TEMP_MIN_C, TARGET_TEMP_MAX_C, TARGET_TEMP_STEP_C);
   TargetTempControl.onChange(handleTempChange);
+
+  StateControl.begin(0.0, 0.0, 2.0, 1.0);
+  StateControl.onChange([](double v) { queueWrite(WriteKind::State, v); });
+
+  ModeControl.begin(0.0, 0.0, 2.0, 1.0);
+  ModeControl.onChange([](double v) { queueWrite(WriteKind::Mode, v); });
 
   // Telemetry sensors
   InletTempSensor.begin();
   OutletTempSensor.begin();
 
-  // Vendor-specific cluster on the same endpoint
+  // Vendor-specific cluster on the main endpoint (TargetTempControl)
   auto *ep = esp_matter::endpoint::get(TargetTempControl.getEndPointId());
   vendorCluster = esp_matter::cluster::create(ep, VENDOR_CLUSTER_ID, esp_matter::cluster_flags::CLUSTER_FLAG_SERVER);
-  attrStateHandle = esp_matter::attribute::create(
-      vendorCluster, ATTR_STATE_ID, esp_matter::ATTRIBUTE_FLAG_WRITABLE, esp_matter_enum8(0));
-  attrModeHandle = esp_matter::attribute::create(
-      vendorCluster, ATTR_MODE_ID, esp_matter::ATTRIBUTE_FLAG_WRITABLE, esp_matter_enum8(0));
   attrCompHzHandle = esp_matter::attribute::create(
       vendorCluster, ATTR_COMP_HZ_ID, esp_matter::ATTRIBUTE_FLAG_NONE, esp_matter_uint16(0));
   attrCompTargetHandle = esp_matter::attribute::create(
       vendorCluster, ATTR_COMP_TARGET_ID, esp_matter::ATTRIBUTE_FLAG_NONE, esp_matter_uint16(0));
-
-  esp_matter::attribute::set_callback(attributeCallback);
 
   Matter.begin();
 }

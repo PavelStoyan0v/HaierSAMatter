@@ -1,19 +1,17 @@
 ## HaierSA Matter Vendor Cluster Notes
 
-This firmware exposes a vendor-specific server cluster on the same endpoint as the TemperatureControlledCabinet:
+This firmware exposes standard Matter interfaces for core controls and a vendor-specific cluster for telemetry:
 
-- Vendor ID: `0xFFF1`
-- Cluster ID: `0xFC01`
-- Attributes  
-  - `0x0001` State (enum8) — `0:OFF`, `1:HEAT`, `2:COOL` (writeable)  
-  - `0x0002` Mode (enum8) — `0:ECO`, `1:QUIET`, `2:TURBO` (writeable)  
+- **Target Temperature**: Standard `TemperatureControlledCabinet` setpoint.
+- **State (OFF/HEAT/COOL)**: Exposed as a standard `TemperatureControlledCabinet` endpoint (Value 0=OFF, 1=HEAT, 2=COOL).
+- **Mode (ECO/QUIET/TURBO)**: Exposed as a standard `TemperatureControlledCabinet` endpoint (Value 0=ECO, 1=QUIET, 2=TURBO).
+- **Inlet/Outlet Temperature**: Standard `TemperatureSensor` endpoints.
+- **Compressor Telemetry (Vendor ID: `0xFFF1`, Cluster ID: `0xFFF1FC01`)**:
   - `0x0003` CompressorFrequencyHz (uint16, read-only)  
   - `0x0004` TargetFrequencyHz (uint16, read-only)
 
-The normal TemperatureControlledCabinet setpoint remains for target temperature. Inlet/outlet temperatures use standard TemperatureSensor endpoints.
-
-### Home Assistant Custom Integration
-This project includes a Home Assistant custom component in the `ha_haier_matter` folder. 
+### Home Assistant Integration
+The custom component in `ha_haier_matter` is now only required for the **Compressor Frequency** sensors. State, Mode, and Temperature are handled natively by the standard Matter integration.
 
 #### Installation
 1. Copy the `custom_components/haier_matter` folder from `ha_haier_matter` into your Home Assistant `config/custom_components/` directory.
@@ -22,11 +20,7 @@ This project includes a Home Assistant custom component in the `ha_haier_matter`
 4. Search for "Haier Matter Bridge".
 5. Enter the **Node ID** and **Endpoint ID** for your device.
 
-The integration will create:
-- **Select** entities for **State** (OFF/HEAT/COOL) and **Mode** (ECO/QUIET/TURBO).
-- **Sensor** entities for **Compressor Frequency** and **Compressor Target Frequency**.
-
-Note: The standard **Target Temperature** setpoint and **Inlet/Outlet** temperatures are handled by the native Matter integration.
+Note: The **Endpoint ID** requested during setup is the one for the main Temperature control; the integration will find the telemetry on the same endpoint.
 
 ### Status LED (NeoPixel)
 The onboard LED indicates the bridge and network status:
