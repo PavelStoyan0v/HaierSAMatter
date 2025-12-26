@@ -1,5 +1,6 @@
 #pragma once
 #include <MatterEndpoints/MatterTemperatureControlledCabinet.h>
+#include <string.h>
 
 /**
  * A generic Matter numeric control endpoint that maps to 
@@ -37,3 +38,16 @@ public:
 private:
   Callback _onChangeCb = nullptr;
 };
+
+/**
+ * Utility to set device identification strings on the Root Node (Endpoint 0).
+ */
+inline void setDeviceIdentification(const char* vendor, const char* product) {
+  using namespace chip::app::Clusters;
+  
+  esp_matter_attr_val_t vName = esp_matter_char_str((char*)vendor, strlen(vendor));
+  esp_matter::attribute::update(0, BasicInformation::Id, BasicInformation::Attributes::VendorName::Id, &vName);
+  
+  esp_matter_attr_val_t pName = esp_matter_char_str((char*)product, strlen(product));
+  esp_matter::attribute::update(0, BasicInformation::Id, BasicInformation::Attributes::ProductName::Id, &pName);
+}

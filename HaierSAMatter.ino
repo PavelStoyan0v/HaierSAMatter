@@ -3,6 +3,9 @@
 #include <Preferences.h>
 #include <OneButton.h>
 
+#include <MatterEndpoints/MatterTemperatureSensor.h>
+#include <MatterEndpoints/MatterContactSensor.h>
+
 #include "Config.h"
 #include "Endpoints.h"
 #include "StatusLED.h"
@@ -16,6 +19,11 @@ OneButton button(BUTTON_PIN, true);
 MatterNumericEndpoint<double> targetTemp;
 MatterNumericEndpoint<uint8_t> deviceState;
 MatterNumericEndpoint<uint8_t> deviceMode;
+
+// Sensors
+MatterTemperatureSensor inletTemp;
+MatterTemperatureSensor outletTemp;
+MatterContactSensor pumpStatus;
 
 void setup() {
   Serial.begin(115200);
@@ -56,6 +64,14 @@ void setup() {
     Serial.printf("Mode: %d (%s)\r\n", mode, mode < 3 ? names[mode] : "??");
     if (mode < 3) matterPref.putUChar(KEY_MODE, mode);
   });
+
+  // --- Sensors ---
+  inletTemp.begin(20.0);  // Initial dummy value
+  outletTemp.begin(25.0); // Initial dummy value
+  pumpStatus.begin(false); // Initial state: Off
+
+  // --- Device Identification ---
+  setDeviceIdentification(VENDOR_NAME, DEVICE_NAME);
 
   Matter.begin();
   if (Matter.isDeviceCommissioned()) {

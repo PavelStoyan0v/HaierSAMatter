@@ -5,6 +5,10 @@
 constexpr uint8_t NEOPIXEL_PIN = 8;
 constexpr uint8_t BUTTON_PIN = BOOT_PIN;
 
+// Device Info
+const char* DEVICE_NAME = "HaierAlink";
+const char* VENDOR_NAME = "HaierSA";
+
 // Preference Keys
 const char* PREF_NAMESPACE = "MatterPrefs";
 const char* KEY_TARGET_TEMP = "TargetTemp";
